@@ -38,7 +38,6 @@ try {
 } catch (error) {
     console.error("❌ ERROR CRÍTICO EN ENLACE: Intentando contingencia por variables...", error.message);
     
-    // Contingencia por si sigues levantando local o si hay delays en el despliegue
     try {
         const serviceAccount = require("./mecaflow-42953-firebase-adminsdk-fbsvc-b873cf106b.json");
         admin.initializeApp({
@@ -56,27 +55,66 @@ const ref = db.ref("mecaflow");
 
 const PRECIO_M3_CANCUN = 72.50; 
 
-// Inicialización de estructura limpia
+// Estructura intermedia en memoria para procesar el Heartbeat sin depender de cambios en la BD
+let estadoGlobalMemoria = {
+    state: "OFF",
+    liters: 0.0,
+    flowRate: 0.0,
+    target: 0.0,
+    historicalLiters: 0.0,
+    leakWarning: false,
+    lastBatchVolume: 0.0,
+    precioM3: PRECIO_M3_CANCUN,
+    totalCostMXN: 0.0,
+    simulatedLeak: false,
+    timestamp: Date.now()
+};
+
+// Inicialización de estructura limpia en Firebase si está vacía
 ref.once("value", (snapshot) => {
     if (!snapshot.exists()) {
-        ref.set({ 
-            state: "OFF", 
-            liters: 0.0, 
-            flowRate: 0.0, 
-            target: 0.0, 
-            historicalLiters: 0.0, 
-            leakWarning: false, 
-            lastBatchVolume: 0.0,
-            precioM3: PRECIO_M3_CANCUN,
-            totalCostMXN: 0.0,
-            simulatedLeak: false,
-            timestamp: Date.now()
-        });
+        ref.set(estadoGlobalMemoria);
+    } else {
+        estadoGlobalMemoria = snapshot.val();
     }
 });
 
+// Escucha activa de Firebase: Sincroniza la memoria RAM del servidor con los cambios externos
+ref.on('value', (snapshot) => {
+    const data = snapshot.val();
+    if (data) {
+        estadoGlobalMemoria = data;
+        retransmitirEstadoActualizado();
+    }
+});
+
+// ⚡ REVISOR INDEPENDIENTE PERIÓDICO (Heartbeat Industrial)
+// Evalúa la latencia del ESP32 de forma obligatoria cada 2.5 segundos
+setInterval(() => {
+    if (estadoGlobalMemoria.timestamp) {
+        const tiempoInactivo = Date.now() - estadoGlobalMemoria.timestamp;
+        const estaDesconectado = tiempoInactivo > 6000; // Tolerancia de 6 segundos
+
+        // Forzar actualización a las interfaces HMI reportando la caída real del hardware
+        broadcastToHMIs({
+            ...estadoGlobalMemoria,
+            hardwareOnline: !estaDesconectado,
+            esp32Connected: !estaDesconectado
+        });
+    }
+}, 2500);
+
 function calcularCosto(litros) {
     return parseFloat(((litros / 1000) * PRECIO_M3_CANCUN).toFixed(2));
+}
+
+function retransmitirEstadoActualizado() {
+    const isHardwareOffline = Date.now() - (estadoGlobalMemoria.timestamp || 0) > 6000;
+    broadcastToHMIs({
+        ...estadoGlobalMemoria,
+        hardwareOnline: !isHardwareOffline,
+        esp32Connected: !isHardwareOffline
+    });
 }
 
 function broadcastToHMIs(payload) {
@@ -88,31 +126,15 @@ function broadcastToHMIs(payload) {
     });
 }
 
-// Escucha activa de Firebase hacia las Apps e Interfaces
-ref.on('value', (snapshot) => {
-    const data = snapshot.val();
-    if (data) {
-        const isHardwareOffline = Date.now() - (data.timestamp || 0) > 6000;
-        broadcastToHMIs({
-            ...data,
-            hardwareOnline: !isHardwareOffline,
-            esp32Connected: !isHardwareOffline
-        });
-    }
-});
-
 // =========================================================================
 // 🌐 REST API HTTP ENDPOINTS
 // =========================================================================
 app.get('/api/status', (req, res) => {
-    ref.once('value', (snapshot) => {
-        const data = snapshot.val() || {};
-        const isHardwareOffline = Date.now() - (data.timestamp || 0) > 6000;
-        res.json({
-            ...data,
-            hardwareOnline: !isHardwareOffline,
-            esp32Connected: !isHardwareOffline
-        }); 
+    const isHardwareOffline = Date.now() - (estadoGlobalMemoria.timestamp || 0) > 6000;
+    res.json({
+        ...estadoGlobalMemoria,
+        hardwareOnline: !isHardwareOffline,
+        esp32Connected: !isHardwareOffline
     });
 });
 
@@ -147,6 +169,9 @@ app.post('/api/maintenance/reset', async (req, res) => {
 // =========================================================================
 wss.on('connection', (ws) => {
     console.log('[WebSocket] Terminal HMI o ESP32 acoplado al bus.');
+    
+    // Envío inmediato al acoplarse una nueva pantalla
+    ws.send(JSON.stringify(estadoGlobalMemoria));
 
     ws.on('message', async (message) => {
         try {
@@ -154,35 +179,33 @@ wss.on('connection', (ws) => {
 
             // Telemetría directa del ESP32
             if (incoming.flowRate !== undefined) {
-                ref.once('value', async (snapshot) => {
-                    const currentData = snapshot.val() || {};
-                    let currentLiters = currentData.liters || 0.0;
+                let currentLiters = estadoGlobalMemoria.liters || 0.0;
 
-                    if (incoming.flowRate > 0.3) {
-                        currentLiters += (incoming.flowRate / 60.0);
-                    }
+                if (incoming.flowRate > 0.3) {
+                    currentLiters += (incoming.flowRate / 60.0);
+                }
 
-                    const nuevoCosto = calcularCosto(currentLiters);
-                    const alarmaFugaActiva = (currentData.state === "ON" && incoming.flowRate > 0.4);
+                const nuevoCosto = calcularCosto(currentLiters);
+                // Lógica de Válvula NA: Cerrada = ON. Si hay flujo estando cerrada -> Fuga activa
+                const alarmaFugaActiva = (estadoGlobalMemoria.state === "ON" && incoming.flowRate > 0.4);
 
-                    let updatePayload = {
-                        flowRate: incoming.flowRate,
-                        liters: parseFloat(currentLiters.toFixed(2)),
-                        totalCostMXN: nuevoCosto,
-                        leakWarning: alarmaFugaActiva || currentData.simulatedLeak,
-                        timestamp: Date.now()
-                    };
+                let updatePayload = {
+                    flowRate: incoming.flowRate,
+                    liters: parseFloat(currentLiters.toFixed(2)),
+                    totalCostMXN: nuevoCosto,
+                    leakWarning: alarmaFugaActiva || estadoGlobalMemoria.simulatedLeak,
+                    timestamp: Date.now()
+                };
 
-                    if (currentData.state === "PORTION" && currentLiters >= currentData.target) {
-                        updatePayload.state = "OFF";
-                        updatePayload.target = 0.0;
-                        updatePayload.lastBatchVolume = parseFloat(currentLiters.toFixed(2));
-                    }
+                if (estadoGlobalMemoria.state === "PORTION" && currentLiters >= estadoGlobalMemoria.target) {
+                    updatePayload.state = "OFF";
+                    updatePayload.target = 0.0;
+                    updatePayload.lastBatchVolume = parseFloat(currentLiters.toFixed(2));
+                }
 
-                    await ref.update(updatePayload);
-                });
+                await ref.update(updatePayload);
             }
-            // Comandos desde las Apps (Botón abrir/cerrar)
+            // Comandos de acción desde las HMIs
             else if (incoming.action === "setValve") {
                 await ref.update({ state: incoming.state, target: incoming.target || 0.0, timestamp: Date.now() });
             }
@@ -194,6 +217,7 @@ wss.on('connection', (ws) => {
         }
     });
 
+    // Envío directo de tramas al ESP32 ante conmutaciones en tiempo real
     const stateRef = db.ref('mecaflow/state');
     const stateListener = stateRef.on('value', (snapshot) => {
         if (ws.readyState === WebSocket.OPEN) {
@@ -203,10 +227,14 @@ wss.on('connection', (ws) => {
 
     ws.on('close', () => {
         stateRef.off('value', stateListener);
+        console.log('[WebSocket] Conexión cerrada en el bus.');
     });
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🤖 Servidor MecaFlow Cloud activo en puerto: ${PORT}`);
+    console.log(`=======================================================`);
+    console.log(`🤖 MecaFlow SCADA Cloud Server levantado con éxito.`);
+    console.log(`📡 Servidor Compartido Express + WebSockets en puerto: ${PORT}`);
+    console.log(`=======================================================`);
 });
